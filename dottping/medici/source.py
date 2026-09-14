@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass, field
 
 from bs4 import BeautifulSoup
 
+from ..freni import freni
 from ..net import BROWSER_HEADERS, FetchError
 
 log = logging.getLogger(__name__)
@@ -46,6 +47,44 @@ _TEL_RE = re.compile(r"Telefono:\s*([0-9 ./+-]{5,})")
 
 class MedicoNonTrovato(Exception):
     """La ricerca non ha prodotto nessun medico corrispondente."""
+
+
+class NomeNonValido(ValueError):
+    """Quello che è arrivato dalla chat non è un nome di persona."""
+
+
+class TroppeRichieste(RuntimeError):
+    """Il tetto globale di richieste al portale è stato raggiunto: si aspetta."""
+
+    def __init__(self, secondi: float) -> None:
+        super().__init__(f"Troppe richieste al portale: riprova tra {int(secondi) + 1}s.")
+        self.secondi = secondi
+
+
+# Nomi di persona: lettere (accentate comprese), spazi, apostrofi, punti, trattini.
+# Tutto il resto — cifre, tag, a capo, punti e virgola, stringhe chilometriche —
+# non arriva mai al portale: non è roba che un medico possa avere nel nome, e
+# spedirla significa solo far sembrare strano il nostro traffico.
+_NOME_OK = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'’ .\-]{2,40}$")
+_ID_LUOGO_OK = re.compile(r"^[A-Za-z0-9_-]{1,16}$")
+
+
+def normalizza_nome(testo: str, *, campo: str = "cognome") -> str:
+    """Ripulisce e controlla quello che arriva dalla chat. Alza NomeNonValido."""
+    pulito = re.sub(r"\s+", " ", testo or "").strip()
+    if not _NOME_OK.match(pulito):
+        raise NomeNonValido(
+            f"Il {campo} può contenere solo lettere, spazi, apostrofi e trattini "
+            "(da 2 a 40 caratteri)."
+        )
+    return pulito
+
+
+def controlla_id_luogo(id_luogo: str) -> str:
+    """L'identificativo interno del portale: corto e alfanumerico, o niente."""
+    if not _ID_LUOGO_OK.match(id_luogo or ""):
+        raise NomeNonValido("Identificativo del medico non valido.")
+    return id_luogo
 
 
 @dataclass
@@ -287,32 +326,66 @@ def _scegli(medici: list[Medico], cognome: str, nome: str | None,
 
 
 async def cerca_disponibilita(
-    cognome: str, nome: str | None = None, id_luogo: str | None = None
+    cognome: str, nome: str | None = None, id_luogo: str | None = None,
+    *, sorgente: str = "utente",
 ) -> tuple[list[Medico], Disponibilita]:
-    """Esegue il flusso completo. Alza MedicoNonTrovato o FetchError.
+    """Esegue il flusso completo. Alza MedicoNonTrovato, FetchError o NomeNonValido.
 
     `id_luogo` serve alla sorveglianza: identifica il medico esatto anche se
     altri condividono il cognome.
+
+    `sorgente="job"` è il controllo periodico nostro: non passa dal tetto
+    globale (è traffico che sappiamo di volere), ma usa la stessa cache e lo
+    stesso semaforo di tutti.
+
+    Qui passano TUTTE le richieste al portale, quindi qui stanno i freni:
+    validazione, cache, tetto globale, semaforo.
     """
+    cognome = normalizza_nome(cognome)
+    nome = normalizza_nome(nome, campo="nome") if nome else None
+    if id_luogo:
+        controlla_id_luogo(id_luogo)
+
+    f = freni()
+    chiave = (cognome.casefold(), (nome or "").casefold(), id_luogo or "")
+    pronto = f.cache.get(chiave)
+    if pronto is not None:
+        log.debug("Cache: %s", chiave)
+        return pronto
+
+    if sorgente != "job":
+        attesa = f.attesa_portale()
+        if attesa > 0:
+            raise TroppeRichieste(attesa)
+
     motori = ["httpx", "curl_cffi"]
     ultimo_errore: Exception | None = None
 
-    for motore in motori:
-        try:
-            medici, dettaglio = await asyncio.to_thread(
-                _flusso, cognome, nome, motore, id_luogo
-            )
-        except ImportError:
-            log.info("curl_cffi non installato: nessun secondo tentativo.")
-            break
-        except FetchError as exc:
-            # 403/503 = probabile filtro sul traffico "da script": riprova col motore dopo
-            ultimo_errore = exc
-            log.warning("Tentativo con %s fallito: %s", motore, exc)
-            continue
+    async with f.semaforo:
+        # Ricontrolla la cache: mentre aspettavamo il semaforo qualcun altro
+        # può aver già chiesto la stessa cosa.
+        pronto = f.cache.get(chiave)
+        if pronto is not None:
+            return pronto
 
-        if not medici:
-            raise MedicoNonTrovato(f"Nessun medico trovato per il cognome '{cognome}'.")
-        return medici, dettaglio
+        for motore in motori:
+            f.segna_portale()
+            try:
+                medici, dettaglio = await asyncio.to_thread(
+                    _flusso, cognome, nome, motore, id_luogo
+                )
+            except ImportError:
+                log.info("curl_cffi non installato: nessun secondo tentativo.")
+                break
+            except FetchError as exc:
+                # 403/503 = probabile filtro sul traffico "da script": riprova col motore dopo
+                ultimo_errore = exc
+                log.warning("Tentativo con %s fallito: %s", motore, exc)
+                continue
+
+            if not medici:
+                raise MedicoNonTrovato(f"Nessun medico trovato per il cognome '{cognome}'.")
+            f.cache.set(chiave, (medici, dettaglio))
+            return medici, dettaglio
 
     raise ultimo_errore or FetchError("Portale della Regione Veneto non raggiungibile.")

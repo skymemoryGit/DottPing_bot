@@ -5,6 +5,9 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now dottping
 #   journalctl -u dottping -f
+#
+# Il .env contiene il token: va tenuto leggibile solo all'utente del servizio.
+#   sudo chown dottping:dottping /opt/dottping/.env && sudo chmod 600 /opt/dottping/.env
 
 [Unit]
 Description=DottPing Telegram Bot
@@ -20,11 +23,41 @@ Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
 
+# --- isolamento ---
+# Il bot legge una pagina pubblica e scrive un SQLite: non gli serve altro.
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Solo IP: niente socket esotici.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+# L'unica cartella scrivibile è quella del database.
 ReadWritePaths=/opt/dottping/data
+
+# --- tetto alle risorse ---
+# Se qualcosa va storto (o qualcuno ci prova), il danno resta in questa unit.
+MemoryMax=512M
+TasksMax=128
+LimitNOFILE=1024
 
 [Install]
 WantedBy=multi-user.target

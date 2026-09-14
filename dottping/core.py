@@ -7,19 +7,19 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from .guard import guarded
+from .guard import guarded, solo_freno
 from .textfmt import esc
+from .wait import clear_wait
 
 log = logging.getLogger(__name__)
 
 HELP = """🩺 <b>DottPing</b> — comandi disponibili
 
 <b>Controllo al volo</b>
-/medico &lt;cognome&gt; — posti liberi di un medico, subito
-  esempio: <code>/medico rossi</code>
+/medico — posti liberi di un medico, subito
 
 <b>Sorveglianza</b>
-/medico_on &lt;cognome&gt; — sorveglia quel medico in questa chat
+/medico_on — sorveglia un medico e avvisami quando cambia
 /medico_lista — chi sto sorvegliando, con l'ultimo stato letto
 /medico_off — togli un medico dalla sorveglianza
 /medico_check — forza subito il controllo di tutti
@@ -35,11 +35,13 @@ HELP = """🩺 <b>DottPing</b> — comandi disponibili
 
 @guarded
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clear_wait(context)
     await update.message.reply_text(
         "👋 Sono <b>DottPing</b>.\n\n"
         "Controllo i posti liberi dai medici di base della Regione Veneto e ti avviso "
         "quando se ne libera uno, così puoi fare domanda di cambio.\n\n"
-        "Prova: <code>/medico rossi</code>\n"
+        "Inizia con /medico per vedere subito com'è messo un medico, "
+        "oppure /medico_on per farti avvisare: il nome te lo chiedo io.\n"
         "Poi /help per il resto.",
         parse_mode=ParseMode.HTML,
     )
@@ -47,12 +49,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 @guarded
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clear_wait(context)
     await update.message.reply_text(HELP, parse_mode=ParseMode.HTML,
                                     disable_web_page_preview=True)
 
 
+@solo_freno
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Volutamente NON protetto: serve a scoprire l'id da mettere in ALLOWED_USER_IDS."""
+    """Volutamente fuori dalla whitelist (serve a scoprire il proprio id per
+    ALLOWED_USER_IDS), ma non fuori dal freno anti-flood."""
     user = update.effective_user
     chat = update.effective_chat
     await update.message.reply_text(
@@ -65,6 +70,7 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 @guarded
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clear_wait(context)
     app_ctx = context.application.bot_data["ctx"]
     s = app_ctx.settings
 
@@ -79,19 +85,26 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         default=None,
     )
 
+    # "campo" è QUALE numero guardiamo sulla scheda (assistiti illimitati o a
+    # termine): scritto per esteso, così non si legge come un conteggio.
+    campi = {
+        "illimitati": "assistiti illimitati",
+        "termine": "assistiti a termine",
+        "entrambi": "assistiti illimitati e a termine",
+    }
+    campo = campi.get(s.medico_campo, s.medico_campo)
+
     await update.message.reply_text(
         "⚙️ <b>Stato di DottPing</b>\n\n"
         f"🩺 <b>Questa chat</b>\n"
-        f"• Sorvegliati: {esc(elenco)}\n"
+        f"• Sorvegliati: {esc(elenco)} ({len(miei)} su {s.max_sorvegliati} posti)\n"
         f"• Dettaglio: /medico_lista\n\n"
         f"🕐 <b>Controlli</b>\n"
         f"• Orari: {esc(orari)} ({esc(s.timezone)})\n"
         f"• Prossimo: {prossimo.strftime('%d/%m/%Y %H:%M') if prossimo else 'non pianificato'}\n"
-        f"• Numero sorvegliato: {esc(s.medico_campo)}\n"
+        f"• Guardo i posti: {esc(campo)}\n"
         f"• Medici seguiti in totale: {len({r['id_luogo'] for r in tutti})} "
-        f"({len(tutti)} righe su {len({r['chat_id'] for r in tutti})} chat)\n\n"
-        f"🔓 <b>Accesso</b>: "
-        f"{'limitato a ' + str(len(s.allowed_user_ids)) + ' utenti' if s.restricted else 'aperto a tutti'}",
+        f"({len(tutti)} righe su {len({r['chat_id'] for r in tutti})} chat)",
         parse_mode=ParseMode.HTML,
     )
 

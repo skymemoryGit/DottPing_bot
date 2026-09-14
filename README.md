@@ -15,18 +15,32 @@ Nato come modulo del bot personale Nora, staccato in un progetto a sé.
 ## Comandi
 
 ```
-/medico rossi          posti liberi di un medico, subito
-/medico_on rossi       sorveglia quel medico in questa chat
-/medico_lista            chi sto sorvegliando, con l'ultimo stato letto
-/medico_off              elenco con i bottoni per togliere
-/medico_check            forza subito un controllo
-/status                  stato del bot e prossimo controllo
-/id                      il tuo id Telegram
+/medico          posti liberi di un medico, subito
+/medico_on       sorveglia un medico in questa chat
+/medico_lista    chi sto sorvegliando, con l'ultimo stato letto
+/medico_off      elenco con i bottoni per togliere
+/medico_check    forza subito un controllo
+/status          stato del bot e prossimo controllo
+/id              il tuo id Telegram
 ```
 
+**Nessun comando vuole parametri.** Il cognome non si scrive attaccato al
+comando: il bot lo chiede («Dimmi il nome del medico da sorvegliare») e legge la
+risposta come un messaggio normale. Chi preferisce può comunque scrivere
+`/medico_on <cognome>` su una riga sola, continua a funzionare.
+
+Dove serve una scelta ci sono i bottoni: la scheda di un medico ha
+«🔔 Avvisami quando si libera un posto», e `/medico_off` elenca i sorvegliati da
+togliere. Se un cognome dà più risultati, i medici trovati compaiono come
+bottoni.
+
+> In un **gruppo** Telegram consegna al bot solo i comandi, a meno che la privacy
+> del bot sia disattivata (BotFather → `/setprivacy` → Disable). Senza quello, in
+> gruppo le risposte libere non arrivano e serve la forma `/medico_on <cognome>`.
+> In chat privata funziona sempre.
+
 Il bot è **aperto a tutti**: ogni chat ha la propria lista di medici, quindi più
-persone possono usarlo senza interferire. Se un cognome dà più risultati, i
-medici trovati compaiono come bottoni.
+persone possono usarlo senza interferire.
 
 ---
 

@@ -125,16 +125,24 @@ async def _avvisa(app_ctx, bot, chat_ids: list[int], testo: str) -> None:
         try:
             await bot.send_message(chat_id=chat_id, text=testo, parse_mode=ParseMode.HTML)
         except Forbidden:
-            log.info("Chat %s ha bloccato Nora: tolgo i suoi medici sorvegliati.", chat_id)
+            log.info("Chat %s ha bloccato il bot: tolgo i suoi medici sorvegliati.", chat_id)
             for riga in await app_ctx.storage.medico_watch_list(chat_id):
                 await app_ctx.storage.medico_watch_remove(chat_id, riga["id_luogo"])
         except TelegramError as exc:
             log.warning("Invio a %s fallito: %s", chat_id, exc)
 
 
-async def controlla_tutti(app_ctx, *, notifica: bool, bot=None) -> tuple[int, list[str]]:
-    """Controlla ogni medico sorvegliato. Ritorna (quanti controllati, errori)."""
-    righe = await app_ctx.storage.medico_watch_list()
+async def controlla_tutti(app_ctx, *, notifica: bool, bot=None,
+                          solo_chat: int | None = None,
+                          sorgente: str = "job") -> tuple[int, list[str]]:
+    """Controlla i medici sorvegliati. Ritorna (quanti controllati, nomi in errore).
+
+    `solo_chat` limita il giro ai medici di una chat: è quello che usa
+    /medico_check, così un utente non può far ricontrollare a comando la lista
+    di tutti gli altri. `sorgente` distingue il giro automatico (nostro, non
+    passa dal tetto globale) da quello chiesto a mano.
+    """
+    righe = await app_ctx.storage.medico_watch_list(solo_chat)
     if not righe:
         return 0, []
 
@@ -151,12 +159,13 @@ async def controlla_tutti(app_ctx, *, notifica: bool, bot=None) -> tuple[int, li
         riferimento = gruppo[0]
         try:
             _, d = await cerca_disponibilita(
-                riferimento["cognome"], riferimento.get("nome") or None, id_luogo
+                riferimento["cognome"], riferimento.get("nome") or None, id_luogo,
+                sorgente=sorgente,
             )
-        except (FetchError, MedicoNonTrovato) as exc:
+        except Exception as exc:  # noqa: BLE001 - un medico che salta non ferma gli altri
             nome = riferimento.get("nome_medico") or riferimento["cognome"]
             log.warning("Controllo di %s fallito: %s", nome, exc)
-            errori.append(f"{nome}: {exc}")
+            errori.append(str(nome))   # il dettaglio resta nel log
             continue
 
         controllati += 1

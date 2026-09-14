@@ -1,5 +1,5 @@
 # --- core ---
-python-telegram-bot[job-queue]>=21.6,<23
+python-telegram-bot[job-queue,rate-limiter]>=21.6,<23
 httpx>=0.27
 beautifulsoup4>=4.12
 python-dotenv>=1.0

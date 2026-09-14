@@ -14,6 +14,7 @@ from typing import Sequence
 from telegram import BotCommand
 from telegram.ext import Application, ContextTypes
 
+from . import freni
 from .config import Settings
 from .storage import Storage
 
@@ -60,8 +61,28 @@ async def _post_init(app: Application) -> None:
 
 def build_application(settings: Settings) -> Application:
     ctx = BotContext(settings=settings, storage=Storage(settings.db_path))
+    freni.configura(settings)
 
-    app = Application.builder().token(settings.token).post_init(_post_init).build()
+    costruttore = (
+        Application.builder()
+        .token(settings.token)
+        .post_init(_post_init)
+        # Un utente lento non deve bloccare gli altri: le richieste al portale
+        # durano decine di secondi. Il numero di flussi HTTP veri resta basso
+        # comunque, lo tiene il semaforo in freni.py.
+        .concurrent_updates(16)
+    )
+    try:
+        from telegram.ext import AIORateLimiter
+        # Rispetta i limiti di invio di Telegram: con molte chat iscritte allo
+        # stesso medico, la raffica di notifiche verrebbe altrimenti troncata
+        # (o farebbe scattare un blocco temporaneo del bot).
+        costruttore = costruttore.rate_limiter(AIORateLimiter())
+    except (ImportError, RuntimeError) as exc:  # extra [rate-limiter] non installato
+        log.warning("Rate limiter degli invii non attivo (%s): "
+                    "pip install 'python-telegram-bot[rate-limiter]'", exc)
+
+    app = costruttore.build()
     app.bot_data["ctx"] = ctx
 
     for dotted in MODULES:

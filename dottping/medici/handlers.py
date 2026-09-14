@@ -1,10 +1,14 @@
 """Comandi del bot.
 
-    /medico <cognome>       controllo a richiesta, non tocca la sorveglianza
-    /medico_on <cognome>    aggiunge il medico alla lista di QUESTA chat
-    /medico_off             elenco con i bottoni per togliere
-    /medico_lista           chi sto sorvegliando in questa chat
-    /medico_check           forza subito il controllo di tutti
+    /medico         controllo a richiesta, non tocca la sorveglianza
+    /medico_on      aggiunge il medico alla lista di QUESTA chat
+    /medico_off     elenco con i bottoni per togliere
+    /medico_lista   chi sto sorvegliando in questa chat
+    /medico_check   forza subito il controllo di tutti
+
+Nessun comando pretende un parametro: se il cognome serve e non c'è, il bot lo
+chiede e legge la risposta libera (vedi `dottping/wait.py` e `risposta_libera`).
+Scriverlo comunque sulla stessa riga continua a funzionare, per chi lo preferisce.
 
 Quali medici sorvegliare si decide dalla chat, non dal .env: la lista sta nella
 tabella `medico_watch`, una riga per (chat, medico). Nel `.env` restano solo le
@@ -20,17 +24,46 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+    MessageHandler, filters,
 )
 
+from ..freni import freni
 from ..net import FetchError
 from ..textfmt import esc
 from ..guard import guarded
+from ..wait import clear_wait, pop_wait, set_wait
 from .jobs import (
     LEGENDA, aggiorna_stato, controlla_tutti, formatta_scheda, job_periodico,
 )
-from .source import Medico, MedicoNonTrovato, cerca_disponibilita
+from .source import (
+    Medico, MedicoNonTrovato, NomeNonValido, TroppeRichieste,
+    cerca_disponibilita, controlla_id_luogo,
+)
 
 log = logging.getLogger(__name__)
+
+# Un messaggio solo per tutti i guasti del portale: all'utente non serve sapere
+# quale URL ha risposto cosa, e a un curioso non si regala la mappa di casa.
+PORTALE_KO = ("❌ Il portale della Regione non risponde in questo momento.\n"
+              "<i>Riprova tra qualche minuto: i controlli automatici continuano lo stesso.</i>")
+
+
+async def _freno_ricerca(update: Update) -> bool:
+    """True se questo utente può far partire un'altra interrogazione del portale."""
+    utente = update.effective_user
+    if utente is None:
+        return False
+    f = freni()
+    attesa = f.attesa_ricerca(utente.id)
+    if attesa > 0:
+        log.info("Freno ricerche: utente %s deve aspettare %.0fs", utente.id, attesa)
+        await update.message.reply_text(
+            f"⏱ Hai fatto parecchie ricerche di fila. Riprova tra {int(attesa) + 1} secondi.\n"
+            "Il portale è un servizio pubblico: meglio non pestarlo."
+        )
+        return False
+    f.segna_ricerca(utente.id)
+    return True
 
 
 def _bottoni_scelta(medici: list[Medico], cognome: str) -> InlineKeyboardMarkup:
@@ -47,6 +80,13 @@ def _bottoni_scelta(medici: list[Medico], cognome: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(righe)
 
 
+def _bottone_aggiungi() -> InlineKeyboardMarkup:
+    """Scorciatoia per iscriversi senza dover scrivere un comando con parametro."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "➕ Sorveglia un medico", callback_data="med:ask",
+    )]])
+
+
 async def _aggiungi(app_ctx, chat_id: int, cognome: str, medico: Medico) -> str:
     """Registra il medico e restituisce il messaggio da mostrare."""
     massimo = app_ctx.settings.max_sorvegliati
@@ -54,6 +94,16 @@ async def _aggiungi(app_ctx, chat_id: int, cognome: str, medico: Medico) -> str:
     if len(gia) >= massimo and medico.id_luogo not in {r["id_luogo"] for r in gia}:
         return (f"⚠️ Sorvegli già {massimo} medici in questa chat. "
                 f"Togline uno con /medico_off.")
+
+    # Tetto globale: ogni medico distinto è una richiesta al portale a ogni
+    # giro di controlli. Senza un limite, abbastanza chat trasformerebbero il
+    # bot in uno scraper — e il portale bloccherebbe questo IP, giustamente.
+    tutti = await app_ctx.storage.medico_watch_list()
+    distinti = {r["id_luogo"] for r in tutti}
+    if medico.id_luogo not in distinti and len(distinti) >= app_ctx.settings.max_medici_totali:
+        log.warning("Tetto globale raggiunto: %d medici distinti sorvegliati.", len(distinti))
+        return ("⚠️ Sto già sorvegliando il massimo di medici che questo bot può seguire.\n"
+                "Riprova più tardi: si libera quando qualcuno toglie i suoi.")
 
     creata = await app_ctx.storage.medico_watch_add(
         chat_id, medico.id_luogo, cognome, "", medico.nome
@@ -73,9 +123,49 @@ async def _aggiungi(app_ctx, chat_id: int, cognome: str, medico: Medico) -> str:
     return f"✅ <b>Aggiunto alla sorveglianza.</b>\n\n{stato}"
 
 
+async def _cerca_e_mostra(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          cognome: str, nome: str = "") -> None:
+    """Controllo a richiesta: mostra la scheda e offre il bottone per iscriversi."""
+    app_ctx = context.application.bot_data["ctx"]
+    s = app_ctx.settings
+
+    if not await _freno_ricerca(update):
+        return
+
+    msg = await update.message.reply_text("⏳ Interrogo il portale della Regione Veneto…")
+    try:
+        medici, d = await cerca_disponibilita(cognome, nome or None)
+    except NomeNonValido as exc:
+        await msg.edit_text(f"✋ {esc(exc)}")
+        return
+    except TroppeRichieste as exc:
+        await msg.edit_text(f"⏱ Troppe richieste in corso. Riprova tra {int(exc.secondi) + 1} secondi.")
+        return
+    except MedicoNonTrovato as exc:
+        await msg.edit_text(f"🔍 {esc(exc)}", parse_mode=ParseMode.HTML)
+        return
+    except FetchError as exc:
+        log.warning("Ricerca fallita per '%s': %s", cognome, exc)
+        await msg.edit_text(PORTALE_KO, parse_mode=ParseMode.HTML)
+        return
+
+    testo = formatta_scheda(d, s.medico_campo)
+    if len(medici) > 1:
+        altri = ", ".join(m.nome for m in medici if m.id_luogo != d.id_luogo)
+        testo += f"\n\n<i>Altri con questo cognome: {esc(altri)}</i>"
+
+    # Niente "/medico_on cognome" da ricopiare: un bottone fa la stessa cosa.
+    tastiera = InlineKeyboardMarkup([[InlineKeyboardButton(
+        "🔔 Avvisami quando si libera un posto",
+        callback_data=f"med:add:{d.id_luogo}:{cognome[:24]}",
+    )]])
+    await msg.edit_text(testo, parse_mode=ParseMode.HTML, reply_markup=tastiera)
+
+
 @guarded
 async def medico_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Controllo a richiesta. Non iscrive niente."""
+    clear_wait(context)
     app_ctx = context.application.bot_data["ctx"]
     s = app_ctx.settings
 
@@ -84,55 +174,39 @@ async def medico_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             (s.medico_nome if not context.args else "")).strip()
 
     if not cognome:
+        set_wait(context, "medico")
         await update.message.reply_text(
-            "Scrivi il cognome del medico: <code>/medico rossi</code>",
+            "🩺 Dimmi il cognome del medico che vuoi controllare.\n"
+            "<i>Rispondi qui sotto, basta il cognome.</i>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    msg = await update.message.reply_text("⏳ Interrogo il portale della Regione Veneto…")
-    try:
-        medici, d = await cerca_disponibilita(cognome, nome or None)
-    except MedicoNonTrovato as exc:
-        await msg.edit_text(f"🔍 {esc(exc)}", parse_mode=ParseMode.HTML)
-        return
-    except FetchError as exc:
-        await msg.edit_text(f"❌ Portale non raggiungibile.\n\n<code>{esc(exc)}</code>",
-                            parse_mode=ParseMode.HTML)
-        return
-
-    testo = formatta_scheda(d, s.medico_campo)
-    if len(medici) > 1:
-        altri = ", ".join(m.nome for m in medici if m.id_luogo != d.id_luogo)
-        testo += f"\n\n<i>Altri con questo cognome: {esc(altri)}</i>"
-    testo += f"\n\n<i>Per essere avvisato quando si liberano posti: " \
-             f"/medico_on {esc(cognome)}</i>"
-    await msg.edit_text(testo, parse_mode=ParseMode.HTML)
+    await _cerca_e_mostra(update, context, cognome, nome)
 
 
-@guarded
-async def medico_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Aggiunge un medico alla sorveglianza di questa chat."""
+async def _sorveglia(update: Update, context: ContextTypes.DEFAULT_TYPE, cognome: str) -> None:
+    """Cerca il medico indicato e lo mette sotto sorveglianza in questa chat."""
     app_ctx = context.application.bot_data["ctx"]
-    cognome = " ".join(context.args).strip() if context.args else ""
 
-    if not cognome:
-        await update.message.reply_text(
-            "Dimmi chi sorvegliare: <code>/medico_on rossi</code>\n"
-            "Puoi seguirne più di uno; /medico_lista mostra quelli attivi.",
-            parse_mode=ParseMode.HTML,
-        )
+    if not await _freno_ricerca(update):
         return
 
     msg = await update.message.reply_text("⏳ Cerco il medico…")
     try:
         medici, _ = await cerca_disponibilita(cognome)
+    except NomeNonValido as exc:
+        await msg.edit_text(f"✋ {esc(exc)}")
+        return
+    except TroppeRichieste as exc:
+        await msg.edit_text(f"⏱ Troppe richieste in corso. Riprova tra {int(exc.secondi) + 1} secondi.")
+        return
     except MedicoNonTrovato as exc:
         await msg.edit_text(f"🔍 {esc(exc)}", parse_mode=ParseMode.HTML)
         return
     except FetchError as exc:
-        await msg.edit_text(f"❌ Portale non raggiungibile.\n\n<code>{esc(exc)}</code>",
-                            parse_mode=ParseMode.HTML)
+        log.warning("Sorveglianza fallita per '%s': %s", cognome, exc)
+        await msg.edit_text(PORTALE_KO, parse_mode=ParseMode.HTML)
         return
 
     if len(medici) > 1:
@@ -154,14 +228,32 @@ async def medico_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @guarded
+async def medico_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Aggiunge un medico alla sorveglianza di questa chat."""
+    clear_wait(context)
+    cognome = " ".join(context.args).strip() if context.args else ""
+
+    if not cognome:
+        set_wait(context, "medico_on")
+        await update.message.reply_text(
+            "🔔 Dimmi il nome del medico da sorvegliare.\n"
+            "<i>Rispondi qui sotto; puoi seguirne più di uno.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await _sorveglia(update, context, cognome)
+
+
+@guarded
 async def medico_lista(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clear_wait(context)
     app_ctx = context.application.bot_data["ctx"]
     righe = await app_ctx.storage.medico_watch_list(update.effective_chat.id)
     if not righe:
         await update.message.reply_text(
-            "Nessun medico sorvegliato in questa chat.\n"
-            "Aggiungine uno con <code>/medico_on cognome</code>.",
-            parse_mode=ParseMode.HTML,
+            "In questa chat non stai sorvegliando nessun medico.",
+            reply_markup=_bottone_aggiungi(),
         )
         return
 
@@ -187,6 +279,7 @@ async def medico_lista(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 @guarded
 async def medico_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Senza argomenti mostra i bottoni; con un cognome toglie direttamente."""
+    clear_wait(context)
     app_ctx = context.application.bot_data["ctx"]
     chat_id = update.effective_chat.id
     righe = await app_ctx.storage.medico_watch_list(chat_id)
@@ -223,21 +316,34 @@ async def medico_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 @guarded
 async def medico_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Controllo forzato dei medici DI QUESTA CHAT.
+
+    Prima controllava quelli di tutte le chat: bastava premerlo in sequenza per
+    far partire decine di richieste al portale a spese dell'IP del server.
+    """
+    clear_wait(context)
     app_ctx = context.application.bot_data["ctx"]
-    righe = await app_ctx.storage.medico_watch_list(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    righe = await app_ctx.storage.medico_watch_list(chat_id)
     if not righe:
         await update.message.reply_text(
-            "Nessun medico sorvegliato. Aggiungine uno con <code>/medico_on cognome</code>.",
-            parse_mode=ParseMode.HTML,
+            "Non c'è niente da controllare: non stai sorvegliando nessun medico.",
+            reply_markup=_bottone_aggiungi(),
         )
         return
 
+    if not await _freno_ricerca(update):
+        return
+
     msg = await update.message.reply_text("⏳ Controllo in corso…")
-    controllati, errori = await controlla_tutti(app_ctx, notifica=True, bot=context.bot)
+    controllati, errori = await controlla_tutti(
+        app_ctx, notifica=True, bot=context.bot, solo_chat=chat_id, sorgente="utente",
+    )
 
     testo = f"✅ Controllati {controllati} medici."
     if errori:
-        testo += "\n\n⚠️ Problemi:\n" + "\n".join(f"• {esc(e)}" for e in errori[:5])
+        # Solo i nomi: il perché sta nel log, non in chat.
+        testo += "\n\n⚠️ Non sono riuscito a leggere: " + esc(", ".join(errori[:5]))
     testo += "\n\n<i>Gli iscritti ricevono un messaggio solo se lo stato è cambiato. " \
              "Lo stato attuale è in /medico_lista.</i>"
     await msg.edit_text(testo, parse_mode=ParseMode.HTML)
@@ -254,20 +360,48 @@ async def bottone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.edit_message_text("⛔ Non sei autorizzato.")
         return
 
-    dati = (query.data or "").split(":")
+    # Il callback_data lo compone il bot e Telegram lo restituisce intatto, ma
+    # ci passa comunque roba scritta da noi a partire da testo dell'utente:
+    # si valida prima di rimandarla al portale. maxsplit=3 lascia intero il
+    # cognome anche se contenesse un ':'.
+    dati = (query.data or "").split(":", 3)
     chat_id = query.message.chat_id
 
     if len(dati) >= 2 and dati[1] == "no":
         await query.edit_message_text("Annullato.")
         return
 
+    if len(dati) >= 2 and dati[1] == "ask":
+        set_wait(context, "medico_on")
+        await query.edit_message_text(
+            "🔔 Dimmi il nome del medico da sorvegliare.\n"
+            "<i>Rispondi qui sotto; puoi seguirne più di uno.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     if len(dati) >= 4 and dati[1] == "add":
         id_luogo, cognome = dati[2], dati[3]
+        utente = query.from_user
+        f = freni()
+        if utente is not None and f.attesa_ricerca(utente.id) > 0:
+            await query.edit_message_text("⏱ Troppe richieste di fila. Riprova tra poco.")
+            return
+        if utente is not None:
+            f.segna_ricerca(utente.id)
+
         await query.edit_message_text("⏳ Aggiungo…")
         try:
             medici, _ = await cerca_disponibilita(cognome, None, id_luogo)
-        except (FetchError, MedicoNonTrovato) as exc:
-            await query.edit_message_text(f"❌ {esc(exc)}", parse_mode=ParseMode.HTML)
+        except (NomeNonValido, TroppeRichieste) as exc:
+            await query.edit_message_text(f"✋ {esc(exc)}")
+            return
+        except MedicoNonTrovato as exc:
+            await query.edit_message_text(f"🔍 {esc(exc)}", parse_mode=ParseMode.HTML)
+            return
+        except FetchError as exc:
+            log.warning("Iscrizione da bottone fallita (%s): %s", id_luogo, exc)
+            await query.edit_message_text(PORTALE_KO, parse_mode=ParseMode.HTML)
             return
         scelto = next((m for m in medici if m.id_luogo == id_luogo), None)
         if scelto is None:
@@ -278,6 +412,11 @@ async def bottone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if len(dati) >= 3 and dati[1] == "del":
+        try:
+            controlla_id_luogo(dati[2])
+        except NomeNonValido:
+            await query.edit_message_text("Bottone non più valido.")
+            return
         righe = await app_ctx.storage.medico_watch_list(chat_id)
         nome = next((r["nome_medico"] or r["cognome"]
                      for r in righe if r["id_luogo"] == dati[2]), dati[2])
@@ -289,6 +428,30 @@ async def bottone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+@guarded
+async def risposta_libera(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Legge un messaggio normale come risposta alla domanda appena fatta dal bot.
+
+    Serve a evitare la sintassi "/comando parametro": il bot chiede il nome del
+    medico e l'utente risponde come parlerebbe a una persona. Se non era stata
+    fatta nessuna domanda il messaggio viene ignorato, così il bot non
+    interviene nelle chiacchiere di un gruppo.
+    """
+    azione = pop_wait(context)
+    if azione is None:
+        return
+
+    testo = (update.message.text or "").strip()
+    if not testo:
+        return
+
+    if azione == "medico":
+        parole = testo.split()
+        await _cerca_e_mostra(update, context, parole[0], " ".join(parole[1:]))
+    elif azione == "medico_on":
+        await _sorveglia(update, context, testo)
+
+
 def register(app: Application, app_ctx) -> None:
     app.add_handler(CommandHandler("medico", medico_command))
     app.add_handler(CommandHandler("disponibilita", medico_command))
@@ -297,6 +460,9 @@ def register(app: Application, app_ctx) -> None:
     app.add_handler(CommandHandler("medico_lista", medico_lista))
     app.add_handler(CommandHandler("medico_check", medico_check))
     app.add_handler(CallbackQueryHandler(bottone, pattern=r"^med:"))
+    # Ultimo: intercetta solo i messaggi normali, e solo se il bot ha appena
+    # fatto una domanda (vedi risposta_libera).
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, risposta_libera))
 
     s = app_ctx.settings
     if app.job_queue is None:
