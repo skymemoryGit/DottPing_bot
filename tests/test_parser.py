@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dottping.medici.source import (  # noqa: E402
-    _scegli, parse_dettaglio, parse_risultati,
+    _scegli, filtra_candidati, parse_dettaglio, parse_risultati,
 )
 
 DIR = Path(__file__).parent
@@ -37,6 +37,17 @@ def test_risultati() -> None:
           "senza nome deve prendere il primo")
     check(_scegli(medici, "gironda", "INESISTENTE").id_luogo == "009249",
           "con un nome che non c'è deve ripiegare sul primo, non esplodere")
+
+    # Omonimi: l'elenco dei candidati serve a far scegliere l'utente invece di
+    # decidere per lui. Due Gironda restano due, uno solo non fa perdere tempo.
+    tutti = filtra_candidati(medici, "gironda")
+    check(len(tutti) == 2, f"due omonimi devono restare due candidati, non {len(tutti)}")
+    uno = filtra_candidati(medici, "gironda", "MARCO")
+    check(len(uno) == 1 and uno[0].id_luogo == "012345",
+          f"col nome deve restare un solo candidato: {[m.nome for m in uno]}")
+    check(len(filtra_candidati(medici, "gironda", "INESISTENTE")) == 2,
+          "un nome che non c'è non deve azzerare i candidati")
+    check(filtra_candidati([], "gironda") == [], "nessun medico, nessun candidato")
 
 
 def test_dettaglio_pieno() -> None:

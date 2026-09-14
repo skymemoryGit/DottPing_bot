@@ -304,6 +304,24 @@ def _flusso(cognome: str, nome: str | None, motore: str,
             chiudi()
 
 
+def filtra_candidati(medici: list[Medico], cognome: str,
+                     nome: str | None = None) -> list[Medico]:
+    """I medici che corrispondono davvero a quello che ha scritto l'utente.
+
+    `_scegli` ne sceglie uno perché il flusso HTTP deve pur aprire una scheda;
+    questa invece li restituisce tutti, perché a scegliere sia l'utente quando
+    ce n'è più di uno (tre Morello sono tre persone diverse, non un dettaglio).
+    """
+    if nome:
+        atteso = nome.strip().casefold()
+        per_nome = [m for m in medici if atteso in m.nome.casefold()]
+        if per_nome:
+            return per_nome
+    cog = cognome.strip().casefold()
+    per_cognome = [m for m in medici if cog in m.nome.casefold()]
+    return per_cognome or medici
+
+
 def _scegli(medici: list[Medico], cognome: str, nome: str | None,
             id_luogo: str | None = None) -> Medico:
     """Sceglie il medico nell'elenco.

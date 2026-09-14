@@ -37,7 +37,7 @@ from .jobs import (
 )
 from .source import (
     Medico, MedicoNonTrovato, NomeNonValido, TroppeRichieste,
-    cerca_disponibilita, controlla_id_luogo,
+    cerca_disponibilita, controlla_id_luogo, filtra_candidati, normalizza_nome,
 )
 
 log = logging.getLogger(__name__)
@@ -66,18 +66,60 @@ async def _freno_ricerca(update: Update) -> bool:
     return True
 
 
-def _bottoni_scelta(medici: list[Medico], cognome: str) -> InlineKeyboardMarkup:
-    """Un bottone per medico. Nel callback stanno idLuogo e cognome: servono
-    entrambi, perché ogni controllo rifà la ricerca dal cognome."""
+def _freno_bottone(query) -> bool:
+    """Come sopra, ma per i bottoni: un tocco che interroga il portale conta
+    come una ricerca (il messaggio di rifiuto lo scrive il chiamante)."""
+    utente = query.from_user
+    if utente is None:
+        return True
+    f = freni()
+    if f.attesa_ricerca(utente.id) > 0:
+        log.info("Freno bottoni: utente %s oltre il limite", utente.id)
+        return False
+    f.segna_ricerca(utente.id)
+    return True
+
+
+def _bottoni_medici(medici: list[Medico], cognome: str,
+                    azione: str) -> InlineKeyboardMarkup:
+    """Un bottone per medico. `azione` dice cosa succede al tocco:
+    `see` apre la scheda, `add` lo mette sotto sorveglianza.
+
+    Nel callback stanno idLuogo e cognome: servono entrambi, perché ogni
+    controllo rifà la ricerca dal cognome. Il cognome si taglia a 20 caratteri:
+    il callback_data di Telegram sta in 64 byte e le lettere accentate ne
+    pesano due.
+    """
     righe = [
         [InlineKeyboardButton(
             f"{m.nome} — {m.indirizzo[:30]}" if m.indirizzo else m.nome,
-            callback_data=f"med:add:{m.id_luogo}:{cognome[:24]}",
+            callback_data=f"med:{azione}:{m.id_luogo}:{cognome[:20]}",
         )]
         for m in medici[:8]
     ]
     righe.append([InlineKeyboardButton("✖️ Annulla", callback_data="med:no")])
     return InlineKeyboardMarkup(righe)
+
+
+def _scheda_e_bottoni(d, candidati: list[Medico], cognome: str,
+                      campo: str) -> tuple[str, InlineKeyboardMarkup]:
+    """La scheda di un medico, con sotto cosa si può fare."""
+    righe = [[InlineKeyboardButton(
+        "🔔 Avvisami quando si libera un posto",
+        callback_data=f"med:add:{d.id_luogo}:{cognome[:20]}",
+    )]]
+    if len(candidati) > 1:
+        # Gli omonimi non si elencano nel testo: ci si torna con un bottone.
+        righe.append([InlineKeyboardButton(
+            f"↩️ Gli altri con questo cognome ({len(candidati) - 1})",
+            callback_data=f"med:list:{cognome[:20]}",
+        )])
+    return formatta_scheda(d, campo), InlineKeyboardMarkup(righe)
+
+
+def _domanda_scelta(candidati: list[Medico], cognome: str) -> str:
+    return (f"Ho trovato {len(candidati)} medici con il cognome "
+            f"«{esc(cognome)}». Quale vuoi vedere?")
 
 
 def _bottone_aggiungi() -> InlineKeyboardMarkup:
@@ -149,16 +191,21 @@ async def _cerca_e_mostra(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await msg.edit_text(PORTALE_KO, parse_mode=ParseMode.HTML)
         return
 
-    testo = formatta_scheda(d, s.medico_campo)
-    if len(medici) > 1:
-        altri = ", ".join(m.nome for m in medici if m.id_luogo != d.id_luogo)
-        testo += f"\n\n<i>Altri con questo cognome: {esc(altri)}</i>"
+    candidati = filtra_candidati(medici, cognome, nome or None)
 
-    # Niente "/medico_on cognome" da ricopiare: un bottone fa la stessa cosa.
-    tastiera = InlineKeyboardMarkup([[InlineKeyboardButton(
-        "🔔 Avvisami quando si libera un posto",
-        callback_data=f"med:add:{d.id_luogo}:{cognome[:24]}",
-    )]])
+    if len(candidati) > 1:
+        # Più omonimi: sceglie l'utente, non il bot. La scheda che abbiamo già
+        # letto la teniamo da parte con la stessa chiave che userà il bottone,
+        # così se sceglie proprio quel medico non si ripassa dal portale.
+        freni().cache.set((normalizza_nome(cognome).casefold(), "", d.id_luogo), (medici, d))
+        await msg.edit_text(
+            _domanda_scelta(candidati, cognome),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_bottoni_medici(candidati, cognome, "see"),
+        )
+        return
+
+    testo, tastiera = _scheda_e_bottoni(d, candidati, cognome, s.medico_campo)
     await msg.edit_text(testo, parse_mode=ParseMode.HTML, reply_markup=tastiera)
 
 
@@ -209,16 +256,17 @@ async def _sorveglia(update: Update, context: ContextTypes.DEFAULT_TYPE, cognome
         await msg.edit_text(PORTALE_KO, parse_mode=ParseMode.HTML)
         return
 
-    if len(medici) > 1:
+    candidati = filtra_candidati(medici, cognome)
+    if len(candidati) > 1:
         await msg.edit_text(
-            f"Ho trovato {len(medici)} medici con il cognome «{esc(cognome)}».\n"
+            f"Ho trovato {len(candidati)} medici con il cognome «{esc(cognome)}».\n"
             "Quale vuoi sorvegliare?",
             parse_mode=ParseMode.HTML,
-            reply_markup=_bottoni_scelta(medici, cognome),
+            reply_markup=_bottoni_medici(candidati, cognome, "add"),
         )
         return
 
-    testo = await _aggiungi(app_ctx, update.effective_chat.id, cognome, medici[0])
+    testo = await _aggiungi(app_ctx, update.effective_chat.id, cognome, candidati[0])
     ore = ", ".join(f"{h:02d}:05" for h in app_ctx.settings.medico_ore)
     await msg.edit_text(
         f"{testo}\n\n🕐 Controlli alle {esc(ore)} ({esc(app_ctx.settings.timezone)}). "
@@ -380,15 +428,70 @@ async def bottone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    if len(dati) >= 4 and dati[1] == "add":
+    if len(dati) >= 4 and dati[1] == "see":
+        # Scelta fatta dall'elenco degli omonimi: apre la scheda di quello.
         id_luogo, cognome = dati[2], dati[3]
-        utente = query.from_user
-        f = freni()
-        if utente is not None and f.attesa_ricerca(utente.id) > 0:
+        if not _freno_bottone(query):
             await query.edit_message_text("⏱ Troppe richieste di fila. Riprova tra poco.")
             return
-        if utente is not None:
-            f.segna_ricerca(utente.id)
+
+        await query.edit_message_text("⏳ Apro la scheda…")
+        try:
+            medici, d = await cerca_disponibilita(cognome, None, id_luogo)
+        except (NomeNonValido, TroppeRichieste) as exc:
+            await query.edit_message_text(f"✋ {esc(exc)}")
+            return
+        except MedicoNonTrovato as exc:
+            await query.edit_message_text(f"🔍 {esc(exc)}", parse_mode=ParseMode.HTML)
+            return
+        except FetchError as exc:
+            log.warning("Apertura scheda fallita (%s): %s", id_luogo, exc)
+            await query.edit_message_text(PORTALE_KO, parse_mode=ParseMode.HTML)
+            return
+
+        candidati = filtra_candidati(medici, cognome)
+        testo, tastiera = _scheda_e_bottoni(d, candidati, cognome, s.medico_campo)
+        await query.edit_message_text(testo, parse_mode=ParseMode.HTML, reply_markup=tastiera)
+        return
+
+    if len(dati) >= 3 and dati[1] == "list":
+        # "Gli altri con questo cognome": si torna all'elenco.
+        cognome = dati[2]
+        if not _freno_bottone(query):
+            await query.edit_message_text("⏱ Troppe richieste di fila. Riprova tra poco.")
+            return
+
+        await query.edit_message_text("⏳ Cerco gli altri…")
+        try:
+            medici, d = await cerca_disponibilita(cognome)
+        except (NomeNonValido, TroppeRichieste) as exc:
+            await query.edit_message_text(f"✋ {esc(exc)}")
+            return
+        except MedicoNonTrovato as exc:
+            await query.edit_message_text(f"🔍 {esc(exc)}", parse_mode=ParseMode.HTML)
+            return
+        except FetchError as exc:
+            log.warning("Elenco omonimi fallito per '%s': %s", cognome, exc)
+            await query.edit_message_text(PORTALE_KO, parse_mode=ParseMode.HTML)
+            return
+
+        candidati = filtra_candidati(medici, cognome)
+        if len(candidati) <= 1:
+            testo, tastiera = _scheda_e_bottoni(d, candidati, cognome, s.medico_campo)
+            await query.edit_message_text(testo, parse_mode=ParseMode.HTML, reply_markup=tastiera)
+            return
+        await query.edit_message_text(
+            _domanda_scelta(candidati, cognome),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_bottoni_medici(candidati, cognome, "see"),
+        )
+        return
+
+    if len(dati) >= 4 and dati[1] == "add":
+        id_luogo, cognome = dati[2], dati[3]
+        if not _freno_bottone(query):
+            await query.edit_message_text("⏱ Troppe richieste di fila. Riprova tra poco.")
+            return
 
         await query.edit_message_text("⏳ Aggiungo…")
         try:
