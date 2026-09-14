@@ -1,0 +1,30 @@
+# Servizio systemd per il VPS.
+#
+#   sudo cp deploy/dottping.service /etc/systemd/system/
+#   sudo nano /etc/systemd/system/dottping.service    # sistema User e i path
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dottping
+#   journalctl -u dottping -f
+
+[Unit]
+Description=DottPing Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dottping
+WorkingDirectory=/opt/dottping
+ExecStart=/opt/dottping/.venv/bin/python /opt/dottping/main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/dottping/data
+
+[Install]
+WantedBy=multi-user.target
