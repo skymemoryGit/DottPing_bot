@@ -13,36 +13,33 @@ from .wait import clear_wait
 
 log = logging.getLogger(__name__)
 
-HELP = """🩺 <b>DottPing</b> — comandi disponibili
+# Un elenco piatto, nell'ordine in cui uno li usa. Niente categorie, niente
+# comandi di servizio: /id serve solo a chi configura il bot, non a chi lo usa
+# (funziona ancora, semplicemente non si annuncia).
+HELP = """🩺 <b>DottPing</b> — comandi
 
-<b>Controllo al volo</b>
 /medico — posti liberi di un medico, subito
-
-<b>Sorveglianza</b>
 /medico_on — sorveglia un medico e avvisami quando cambia
 /medico_lista — chi sto sorvegliando, con l'ultimo stato letto
 /medico_off — togli un medico dalla sorveglianza
-/medico_check — forza subito il controllo di tutti
-
-<b>Utilità</b>
-/id — il tuo id Telegram e quello della chat
+/medico_check — controlla adesso
 /status — stato del bot e dei controlli
-/help — questo messaggio
-
-<i>Fonte dei dati: portale della Regione Veneto,
-"Trova Medici di Medicina Generale e Pediatri di Libera Scelta".</i>"""
+/supporta — offri un caffè a DottPing ☕"""
 
 
 @guarded
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     clear_wait(context)
+    # I comandi restano testo semplice, non <code>: così Telegram li rende
+    # toccabili e chi arriva parte con un dito, non copiandoli a mano.
     await update.message.reply_text(
         "👋 Sono <b>DottPing</b>.\n\n"
-        "Controllo i posti liberi dai medici di base della Regione Veneto e ti avviso "
-        "quando se ne libera uno, così puoi fare domanda di cambio.\n\n"
-        "Inizia con /medico per vedere subito com'è messo un medico, "
-        "oppure /medico_on per farti avvisare: il nome te lo chiedo io.\n"
-        "Poi /help per il resto.",
+        "Cerchi un medico di base in Veneto?\n"
+        "Controllo per te quando il medico desiderato ha un posto libero e ti avviso, "
+        "così puoi fare domanda di cambio.\n\n"
+        "/medico → cerca un medico\n"
+        "/medico_on → attiva l'avviso\n"
+        "/help → tutto il resto",
         parse_mode=ParseMode.HTML,
     )
 

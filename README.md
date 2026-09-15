@@ -21,8 +21,11 @@ Nato come modulo del bot personale Nora, staccato in un progetto a sé.
 /medico_off      elenco con i bottoni per togliere
 /medico_check    forza subito un controllo
 /status          stato del bot e prossimo controllo
-/id              il tuo id Telegram
+/supporta        offri un caffè a DottPing
 ```
+
+`/id` esiste ancora (dice il tuo id Telegram, serve per `ALLOWED_USER_IDS`) ma
+non compare né nel menu né in `/help`: a chi cerca un medico non interessa.
 
 **Nessun comando vuole parametri.** Il cognome non si scrive attaccato al
 comando: il bot lo chiede («Dimmi il nome del medico da sorvegliare») e legge la
@@ -71,6 +74,7 @@ python tools\check_portale.py rossi
 ```powershell
 python tests\test_parser.py     # i parser reggono il markup del portale
 python tests\test_smoke.py      # storage, comandi, job, messaggi — tutto offline
+python tests\test_sicurezza.py  # validazione degli input e freni anti-abuso
 ```
 
 ---
@@ -142,7 +146,10 @@ DottPing_bot/
 │   ├── storage.py          SQLite (medici sorvegliati, ultimo stato)
 │   ├── net.py              HTTP con header browser + ripiego anti-WAF
 │   ├── textfmt.py          escaping HTML e taglio messaggi
-│   ├── guard.py            whitelist utenti (facoltativa)
+│   ├── guard.py            whitelist utenti + freno anti-flood
+│   ├── freni.py            limiti per utente e globali, cache del portale
+│   ├── wait.py             "sto aspettando una risposta" (comandi senza parametri)
+│   ├── supporto.py         /supporta e il bottone delle offerte
 │   ├── core.py             /start /help /id /status
 │   └── medici/
 │       ├── source.py       flusso a 3 passaggi + parser
@@ -173,6 +180,57 @@ sudo cp deploy/dottping.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now dottping
 journalctl -u dottping -f
 ```
+
+---
+
+## Freni anti-abuso
+
+Il bot è aperto a tutti, il portale della Regione no: ogni ricerca sono tre
+richieste fatte dall'IP del server. Senza limiti basterebbe un utente molesto
+per far sembrare il server uno scraper e farlo bloccare. I freni stanno in
+`dottping/freni.py`, i numeri nel `.env`:
+
+| Limite | Default | Cosa impedisce |
+|---|---|---|
+| `MAX_COMANDI_MIN` | 20/min per utente | flood di messaggi al bot |
+| `MAX_RICERCHE_MIN` | 8/min per utente | usare il bot per martellare il portale |
+| `MAX_RICERCHE_ORA` | 60/ora per utente | la stessa cosa, con più pazienza |
+| `MAX_PORTALE_MIN` | 30/min in totale | il traffico complessivo in uscita |
+| `MAX_MEDICI_TOTALI` | 50 medici distinti | che i controlli automatici diventino uno scraping |
+| `MAX_SORVEGLIATI` | 3 per chat | che una chat si prenda tutto lo spazio |
+| `CACHE_PORTALE_S` | 120 s | rifare la stessa domanda al portale |
+| `PORTALE_PARALLELI` | 2 | raffiche di connessioni contemporanee |
+
+Chi supera il limite viene avvisato **una volta** e poi ignorato finché non
+rallenta: rispondere a ogni messaggio di un flood significa floodare con lui.
+I nomi cercati vengono validati prima di partire (solo lettere, spazi,
+apostrofi e trattini, 2-40 caratteri), e gli errori del portale arrivano in
+chat come messaggio generico — il dettaglio resta nel log.
+
+`/medico_check` ricontrolla **solo i medici della chat che lo chiede**: prima
+faceva ripartire il giro su tutte le chat, ed era il modo più comodo per far
+uscire tante richieste con un solo comando.
+
+---
+
+## Le offerte
+
+`dottping/supporto.py`, un modulo a sé come gli altri. L'indirizzo sta nel
+`.env`:
+
+```
+SUPPORTO_URL=https://ko-fi.com/skymemory
+```
+
+Deve essere **https**, altrimenti viene scartato e il bottone sparisce: chi
+tocca un bottone di un bot si fida del bot, e un indirizzo qualsiasi lì dentro
+manderebbe la gente dove capita. Chi riusa questo codice, svuotando la riga
+toglie la richiesta del tutto.
+
+Il cappello si passa in due posti soli: quando qualcuno scrive `/supporta`, e
+sotto la notifica «🟢 POSTI DISPONIBILI» — l'unico momento in cui il bot ha
+davvero risolto un problema. Sulla notifica di posti esauriti no: nessuno ha
+voglia di offrire caffè per una brutta notizia.
 
 ---
 

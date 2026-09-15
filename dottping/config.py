@@ -64,12 +64,14 @@ class Settings:
     medico_nome: str = ""
     max_sorvegliati: int = 3           # medici sorvegliabili per chat
 
+    supporto_url: str = ""             # pagina per le offerte (vedi dottping/supporto.py)
+
     # --- freni anti-abuso (vedi dottping/freni.py) ---
     max_medici_totali: int = 50        # medici distinti sorvegliati da tutto il bot
     max_comandi_min: int = 20          # messaggi al minuto accettati da un utente
-    max_ricerche_min: int = 5          # interrogazioni del portale per utente, al minuto
-    max_ricerche_ora: int = 40         # idem, all'ora
-    max_portale_min: int = 20          # richieste al portale in tutto, al minuto
+    max_ricerche_min: int = 8          # interrogazioni del portale per utente, al minuto
+    max_ricerche_ora: int = 60         # idem, all'ora
+    max_portale_min: int = 30          # richieste al portale in tutto, al minuto
     cache_portale_s: int = 120         # per quanto tengo buona una risposta del portale
     portale_paralleli: int = 2         # flussi HTTP contemporanei verso il portale
 
@@ -96,6 +98,13 @@ def load_settings() -> Settings:
     except ValueError:
         massimo = 3
 
+    # Solo https: un bottone di Telegram con dentro un indirizzo qualsiasi
+    # manderebbe gli utenti dove capita, e chi tocca un bottone di un bot si
+    # fida del bot.
+    supporto = (os.getenv("SUPPORTO_URL") or "https://ko-fi.com/skymemory").strip()
+    if not supporto.startswith("https://"):
+        supporto = ""
+
     def _intero(nome: str, default: int, minimo: int = 1) -> int:
         """Numero dal .env, con un pavimento: un limite a 0 spegnerebbe il bot."""
         try:
@@ -114,11 +123,12 @@ def load_settings() -> Settings:
         medico_cognome=(os.getenv("COGNOME_DEFAULT") or "").strip(),
         medico_nome=(os.getenv("NOME_DEFAULT") or "").strip(),
         max_sorvegliati=max(1, massimo),
+        supporto_url=supporto,
         max_medici_totali=_intero("MAX_MEDICI_TOTALI", 50),
         max_comandi_min=_intero("MAX_COMANDI_MIN", 20),
-        max_ricerche_min=_intero("MAX_RICERCHE_MIN", 5),
-        max_ricerche_ora=_intero("MAX_RICERCHE_ORA", 40),
-        max_portale_min=_intero("MAX_PORTALE_MIN", 20),
+        max_ricerche_min=_intero("MAX_RICERCHE_MIN", 8),
+        max_ricerche_ora=_intero("MAX_RICERCHE_ORA", 60),
+        max_portale_min=_intero("MAX_PORTALE_MIN", 30),
         cache_portale_s=_intero("CACHE_PORTALE_S", 120, minimo=0),
         portale_paralleli=_intero("PORTALE_PARALLELI", 2),
     )

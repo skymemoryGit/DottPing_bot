@@ -3,6 +3,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -95,6 +96,50 @@ def freni_checks() -> None:
           f"le chiavi scadute non vengono sfoltite: {len(tanti._eventi)}")
 
 
+def sanzioni_checks() -> None:
+    """La pausa deve crescere a ogni ricaduta, non restare sempre di un minuto."""
+    s = mod_freni.Sanzioni(scala=(60, 300, 900, 3600), decadenza_s=3600)
+
+    check(s.residuo(1) == 0, "un utente nuovo non è in pausa")
+    check(s.infrazione(1) == 60, "la prima pausa è la più corta")
+    check(s.residuo(1) > 0, "dopo l'infrazione deve esserci una pausa in corso")
+
+    # Insistere DURANTE la pausa non la allunga: sta già fermo.
+    prima = s.residuo(1)
+    check(s.infrazione(1) <= prima + 1, "bussare durante la pausa non deve aggravarla")
+    check(s.stato(1)["gradini"] == 1, "i gradini non devono salire mentre è in pausa")
+
+    # Ricaduta dopo la pausa: si sale di gradino
+    s._stato[1]["fino_a"] = time.time() - 1          # pausa finita
+    check(s.infrazione(1) == 300, "la seconda infrazione deve costare di più")
+    s._stato[1]["fino_a"] = time.time() - 1
+    check(s.infrazione(1) == 900, "la terza ancora di più")
+    s._stato[1]["fino_a"] = time.time() - 1
+    check(s.infrazione(1) == 3600, "la quarta arriva in cima alla scala")
+    s._stato[1]["fino_a"] = time.time() - 1
+    check(s.infrazione(1) == 3600, "oltre la cima la pausa resta al massimo, non esplode")
+
+    # Chi si comporta bene per un po' torna pulito
+    s._stato[1]["fino_a"] = time.time() - 1
+    s._stato[1]["ultima"] = time.time() - 7200      # due ore fa, oltre la decadenza
+    check(s.infrazione(1) == 60, "dopo la decadenza si riparte dalla pausa più corta")
+
+    check(s.residuo(2) == 0, "la pausa di uno non tocca gli altri")
+
+    # Ripristino dopo un riavvio
+    nuova = mod_freni.Sanzioni(scala=(60, 300), decadenza_s=3600)
+    quante = nuova.ripristina([
+        {"utente": 5, "gradini": 2, "fino_a": time.time() + 500, "ultima": time.time()},
+        {"utente": 6, "gradini": 1, "fino_a": time.time() - 500, "ultima": time.time() - 9999},
+        {"rotta": True},
+    ])
+    check(quante == 1, f"doveva ripristinare una sola pausa attiva, non {quante}")
+    check(nuova.residuo(5) > 0, "la pausa attiva non è sopravvissuta al riavvio")
+    check(nuova.residuo(6) == 0, "una pausa scaduta non va ripristinata")
+
+    check(mod_freni.Freni().residuo(99) == 0, "i freni nuovi non hanno pause attive")
+
+
 def cache_checks() -> None:
     cache = mod_freni.CacheBreve(ttl_s=0.05, massimo=4)
     cache.set("k", {"a": [1, 2]})
@@ -126,12 +171,13 @@ def settings_checks() -> None:
 def main() -> int:
     validazione_checks()
     freni_checks()
+    sanzioni_checks()
     cache_checks()
     settings_checks()
     for e in errors:
         print(f"FAIL: {e}")
     if not errors:
-        print("OK: sicurezza - validazione input, freni per utente e globali, cache, limiti dal .env")
+        print("OK: sicurezza - validazione input, freni, pause progressive, cache, limiti dal .env")
     return 1 if errors else 0
 
 

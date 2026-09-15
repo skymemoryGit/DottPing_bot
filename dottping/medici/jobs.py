@@ -20,6 +20,7 @@ from telegram.error import Forbidden, TelegramError
 from telegram.ext import ContextTypes
 
 from ..net import FetchError
+from ..supporto import tastiera as bottone_supporto
 from ..textfmt import esc
 from .source import Disponibilita, MedicoNonTrovato, cerca_disponibilita
 
@@ -46,6 +47,11 @@ def _valore_osservato(d: Disponibilita, campo: str) -> int:
     return d.illimitati or 0
 
 
+def posti_liberi(d: Disponibilita, campo: str = "illimitati") -> bool:
+    """Se c'è qualcosa da prendere adesso, sul numero che stiamo sorvegliando."""
+    return _valore_osservato(d, campo) > 0
+
+
 def formatta_scheda(d: Disponibilita, campo: str = "illimitati") -> str:
     """Il messaggio di /medico: stato completo, senza enfasi.
 
@@ -59,6 +65,10 @@ def formatta_scheda(d: Disponibilita, campo: str = "illimitati") -> str:
         f"{icona} <b>Assistiti illimitati: {d.illimitati if d.illimitati is not None else 'n/d'}</b>",
         f"▫️ Assistiti a termine: {d.a_termine if d.a_termine is not None else 'n/d'}",
         f"🗓 Rilevazione del {esc(d.data_rilevazione)}" if d.data_rilevazione else None,
+        "",
+        # Se il posto c'è già, la cosa utile da dire non è "ti avviso": è "vai".
+        "👉 <b>Puoi presentare domanda di cambio medico adesso.</b>"
+        if posti_liberi(d, campo) else None,
         "",
         f"📍 {esc(d.indirizzo)}" if d.indirizzo else None,
         f"☎️ {esc(d.telefono)}" if d.telefono else None,
@@ -120,10 +130,11 @@ async def aggiorna_stato(app_ctx, d: Disponibilita, campo: str) -> tuple[bool, i
     return cambiato, prima or 0
 
 
-async def _avvisa(app_ctx, bot, chat_ids: list[int], testo: str) -> None:
+async def _avvisa(app_ctx, bot, chat_ids: list[int], testo: str, tastiera=None) -> None:
     for chat_id in chat_ids:
         try:
-            await bot.send_message(chat_id=chat_id, text=testo, parse_mode=ParseMode.HTML)
+            await bot.send_message(chat_id=chat_id, text=testo, parse_mode=ParseMode.HTML,
+                                   reply_markup=tastiera)
         except Forbidden:
             log.info("Chat %s ha bloccato il bot: tolgo i suoi medici sorvegliati.", chat_id)
             for riga in await app_ctx.storage.medico_watch_list(chat_id):
@@ -176,8 +187,12 @@ async def controlla_tutti(app_ctx, *, notifica: bool, bot=None,
         )
 
         if cambiato and notifica and bot is not None:
-            testo = formatta_notifica(d, campo, prima, _valore_osservato(d, campo))
-            await _avvisa(app_ctx, bot, [r["chat_id"] for r in gruppo], testo)
+            adesso = _valore_osservato(d, campo)
+            testo = formatta_notifica(d, campo, prima, adesso)
+            # Il cappello si passa solo alla buona notizia: se i posti si sono
+            # esauriti, nessuno ha voglia di offrire caffè.
+            tastiera = bottone_supporto(app_ctx.settings) if adesso > 0 else None
+            await _avvisa(app_ctx, bot, [r["chat_id"] for r in gruppo], testo, tastiera)
 
     return controllati, errori
 

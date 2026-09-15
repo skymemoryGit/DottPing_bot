@@ -29,11 +29,12 @@ from telegram.ext import (
 
 from ..freni import freni
 from ..net import FetchError
-from ..textfmt import esc
-from ..guard import guarded
+from ..textfmt import durata_leggibile, esc
+from ..guard import guarded, registra_infrazione
 from ..wait import clear_wait, pop_wait, set_wait
 from .jobs import (
     LEGENDA, aggiorna_stato, controlla_tutti, formatta_scheda, job_periodico,
+    posti_liberi,
 )
 from .source import (
     Medico, MedicoNonTrovato, NomeNonValido, TroppeRichieste,
@@ -48,36 +49,49 @@ PORTALE_KO = ("❌ Il portale della Regione non risponde in questo momento.\n"
               "<i>Riprova tra qualche minuto: i controlli automatici continuano lo stesso.</i>")
 
 
-async def _freno_ricerca(update: Update) -> bool:
-    """True se questo utente può far partire un'altra interrogazione del portale."""
+async def _freno_ricerca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True se questo utente può far partire un'altra interrogazione del portale.
+
+    Superare il limite non costa sempre un minuto: la pausa cresce a ogni
+    ricaduta (vedi `freni.SCALA_PAUSE`), altrimenti basterebbe aspettare e
+    ricominciare per sempre.
+    """
     utente = update.effective_user
     if utente is None:
         return False
     f = freni()
-    attesa = f.attesa_ricerca(utente.id)
-    if attesa > 0:
-        log.info("Freno ricerche: utente %s deve aspettare %.0fs", utente.id, attesa)
+    if f.residuo(utente.id) > 0:
+        return False
+
+    if f.attesa_ricerca(utente.id) > 0:
+        durata = await registra_infrazione(context, utente.id)
         await update.message.reply_text(
-            f"⏱ Hai fatto parecchie ricerche di fila. Riprova tra {int(attesa) + 1} secondi.\n"
-            "Il portale è un servizio pubblico: meglio non pestarlo."
+            f"⏱ Troppe ricerche di fila. Riprendo tra {durata_leggibile(durata)}.\n"
+            "Il portale è un servizio pubblico: se insisti la pausa si allunga."
         )
         return False
+
     f.segna_ricerca(utente.id)
     return True
 
 
-def _freno_bottone(query) -> bool:
-    """Come sopra, ma per i bottoni: un tocco che interroga il portale conta
-    come una ricerca (il messaggio di rifiuto lo scrive il chiamante)."""
+async def _freno_bottone(query, context: ContextTypes.DEFAULT_TYPE) -> float:
+    """Come sopra per i bottoni, che non passano dal guard.
+
+    Ritorna 0 se si può procedere, altrimenti i secondi di pausa (il messaggio
+    lo scrive il chiamante, che sa quale bottone è stato toccato).
+    """
     utente = query.from_user
     if utente is None:
-        return True
+        return 0.0
     f = freni()
+    residuo = f.residuo(utente.id)
+    if residuo > 0:
+        return residuo
     if f.attesa_ricerca(utente.id) > 0:
-        log.info("Freno bottoni: utente %s oltre il limite", utente.id)
-        return False
+        return await registra_infrazione(context, utente.id)
     f.segna_ricerca(utente.id)
-    return True
+    return 0.0
 
 
 def _bottoni_medici(medici: list[Medico], cognome: str,
@@ -102,19 +116,26 @@ def _bottoni_medici(medici: list[Medico], cognome: str,
 
 
 def _scheda_e_bottoni(d, candidati: list[Medico], cognome: str,
-                      campo: str) -> tuple[str, InlineKeyboardMarkup]:
-    """La scheda di un medico, con sotto cosa si può fare."""
-    righe = [[InlineKeyboardButton(
-        "🔔 Avvisami quando si libera un posto",
-        callback_data=f"med:add:{d.id_luogo}:{cognome[:20]}",
-    )]]
+                      campo: str) -> tuple[str, InlineKeyboardMarkup | None]:
+    """La scheda di un medico, con sotto cosa si può fare.
+
+    La campanella compare solo se il medico è pieno: se un posto c'è già, non
+    c'è niente da aspettare — si va a fare domanda, e il messaggio lo dice.
+    """
+    righe = []
+    if not posti_liberi(d, campo):
+        righe.append([InlineKeyboardButton(
+            "🔔 Avvisami quando si libera un posto",
+            callback_data=f"med:add:{d.id_luogo}:{cognome[:20]}",
+        )])
     if len(candidati) > 1:
         # Gli omonimi non si elencano nel testo: ci si torna con un bottone.
         righe.append([InlineKeyboardButton(
             f"↩️ Gli altri con questo cognome ({len(candidati) - 1})",
             callback_data=f"med:list:{cognome[:20]}",
         )])
-    return formatta_scheda(d, campo), InlineKeyboardMarkup(righe)
+    tastiera = InlineKeyboardMarkup(righe) if righe else None
+    return formatta_scheda(d, campo), tastiera
 
 
 def _domanda_scelta(candidati: list[Medico], cognome: str) -> str:
@@ -171,7 +192,7 @@ async def _cerca_e_mostra(update: Update, context: ContextTypes.DEFAULT_TYPE,
     app_ctx = context.application.bot_data["ctx"]
     s = app_ctx.settings
 
-    if not await _freno_ricerca(update):
+    if not await _freno_ricerca(update, context):
         return
 
     msg = await update.message.reply_text("⏳ Interrogo il portale della Regione Veneto…")
@@ -236,7 +257,7 @@ async def _sorveglia(update: Update, context: ContextTypes.DEFAULT_TYPE, cognome
     """Cerca il medico indicato e lo mette sotto sorveglianza in questa chat."""
     app_ctx = context.application.bot_data["ctx"]
 
-    if not await _freno_ricerca(update):
+    if not await _freno_ricerca(update, context):
         return
 
     msg = await update.message.reply_text("⏳ Cerco il medico…")
@@ -380,7 +401,7 @@ async def medico_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    if not await _freno_ricerca(update):
+    if not await _freno_ricerca(update, context):
         return
 
     msg = await update.message.reply_text("⏳ Controllo in corso…")
@@ -431,8 +452,11 @@ async def bottone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(dati) >= 4 and dati[1] == "see":
         # Scelta fatta dall'elenco degli omonimi: apre la scheda di quello.
         id_luogo, cognome = dati[2], dati[3]
-        if not _freno_bottone(query):
-            await query.edit_message_text("⏱ Troppe richieste di fila. Riprova tra poco.")
+        pausa = await _freno_bottone(query, context)
+        if pausa > 0:
+            await query.edit_message_text(
+                f"⏱ Troppe richieste di fila. Riprendo tra {durata_leggibile(pausa)}."
+            )
             return
 
         await query.edit_message_text("⏳ Apro la scheda…")
@@ -457,8 +481,11 @@ async def bottone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(dati) >= 3 and dati[1] == "list":
         # "Gli altri con questo cognome": si torna all'elenco.
         cognome = dati[2]
-        if not _freno_bottone(query):
-            await query.edit_message_text("⏱ Troppe richieste di fila. Riprova tra poco.")
+        pausa = await _freno_bottone(query, context)
+        if pausa > 0:
+            await query.edit_message_text(
+                f"⏱ Troppe richieste di fila. Riprendo tra {durata_leggibile(pausa)}."
+            )
             return
 
         await query.edit_message_text("⏳ Cerco gli altri…")
@@ -489,8 +516,11 @@ async def bottone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if len(dati) >= 4 and dati[1] == "add":
         id_luogo, cognome = dati[2], dati[3]
-        if not _freno_bottone(query):
-            await query.edit_message_text("⏱ Troppe richieste di fila. Riprova tra poco.")
+        pausa = await _freno_bottone(query, context)
+        if pausa > 0:
+            await query.edit_message_text(
+                f"⏱ Troppe richieste di fila. Riprendo tra {durata_leggibile(pausa)}."
+            )
             return
 
         await query.edit_message_text("⏳ Aggiungo…")

@@ -7,9 +7,16 @@ Due filtri, indipendenti:
 
 Il freno serve perché il bot è pubblico: senza, un utente che tiene premuto
 invio occupa il processo e, comando dopo comando, fa partire richieste verso il
-portale della Regione dall'IP di questo server. Chi supera il limite viene
-avvisato una volta e poi ignorato in silenzio, finché non rallenta: rispondere
-a ogni messaggio di un flood significa floodare insieme a lui.
+portale della Regione dall'IP di questo server.
+
+Chi supera un limite non si prende sempre la stessa pausa: la prima volta è un
+minuto, poi cinque, un quarto d'ora, un'ora, sei ore, un giorno (vedi
+`freni.SCALA_PAUSE`). Una pausa fissa sarebbe inutile contro uno script, che
+aspetterebbe il minuto e ricomincerebbe all'infinito. Chi invece ha solo
+cliccato troppo in fretta una volta torna a zero dopo sei ore tranquille.
+
+Durante la pausa il bot tace: rispondere a ogni messaggio di chi martella
+significa martellare insieme a lui.
 """
 from __future__ import annotations
 
@@ -21,25 +28,47 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from .freni import freni
+from .textfmt import durata_leggibile
 
 log = logging.getLogger(__name__)
 
 Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]
 
 
-async def _passa_il_freno(update: Update) -> bool:
-    """True se l'utente può procedere; altrimenti lo avvisa (una volta) e blocca."""
+async def registra_infrazione(context: ContextTypes.DEFAULT_TYPE, utente: int) -> float:
+    """Fa scattare (o allungare) la pausa e la salva. Ritorna i secondi."""
+    durata = freni().infrazione(utente)
+    app_ctx = context.application.bot_data.get("ctx")
+    if app_ctx is not None:
+        try:
+            # Su disco, altrimenti basterebbe un riavvio del bot per
+            # cancellare una pausa da ventiquattr'ore.
+            await app_ctx.storage.kv_set(f"ban:{utente}", freni().sanzioni.stato(utente))
+        except Exception as exc:  # noqa: BLE001 - la pausa vale comunque, in memoria
+            log.warning("Pausa di %s non salvata: %s", utente, exc)
+    log.warning("Pausa anti-abuso per %s: %s", utente, durata_leggibile(durata))
+    return durata
+
+
+async def _passa_il_freno(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True se l'utente può procedere; altrimenti lo ferma."""
     utente = update.effective_user
     if utente is None:
         return False
 
     f = freni()
-    attesa = f.attesa_comando(utente.id)
-    if attesa > 0:
-        log.info("Freno: utente %s oltre il limite di comandi (%.0fs)", utente.id, attesa)
-        if update.message is not None and f.deve_avvisare(utente.id):
+
+    # Già in pausa: silenzio totale finché non scade.
+    if f.residuo(utente.id) > 0:
+        return False
+
+    if f.attesa_comando(utente.id) > 0:
+        durata = await registra_infrazione(context, utente.id)
+        if update.message is not None:
             await update.message.reply_text(
-                "⏱ Stai andando troppo veloce. Riprendo ad ascoltarti tra poco."
+                f"⏱ Troppi messaggi di fila. Riprendo ad ascoltarti tra "
+                f"{durata_leggibile(durata)}.\n"
+                "Se insisti la pausa si allunga."
             )
         return False
 
@@ -51,7 +80,7 @@ def solo_freno(func: Handler) -> Handler:
     """Solo il limite di velocità, nessun controllo di whitelist."""
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await _passa_il_freno(update):
+        if not await _passa_il_freno(update, context):
             return
         await func(update, context)
 
@@ -75,7 +104,7 @@ def guarded(func: Handler) -> Handler:
                     await update.message.reply_text("⛔ Questo bot non è aperto al pubblico.")
                 return
 
-        if not await _passa_il_freno(update):
+        if not await _passa_il_freno(update, context):
             return
         await func(update, context)
 

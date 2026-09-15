@@ -67,7 +67,8 @@ def app_checks() -> None:
         for cmd in getattr(h, "commands", set()) or set()
     }
     attesi = {"start", "help", "id", "status", "medico", "disponibilita",
-              "medico_on", "medico_off", "medico_lista", "medico_check"}
+              "medico_on", "medico_off", "medico_lista", "medico_check",
+              "supporta", "dona"}
     mancanti = attesi - registered
     check(not mancanti, f"comandi non registrati: {sorted(mancanti)}")
 
@@ -79,6 +80,32 @@ def app_checks() -> None:
     callback = [h for hs in app.handlers.values() for h in hs
                 if isinstance(h, CallbackQueryHandler)]
     check(bool(callback), "manca il gestore dei bottoni inline")
+
+
+def supporto_checks() -> None:
+    """Il bottone delle offerte esiste solo se l'indirizzo è configurato e https."""
+    from dottping.supporto import tastiera
+
+    class FintoSettings:
+        supporto_url = "https://ko-fi.com/esempio"
+
+    bottoni = tastiera(FintoSettings())
+    check(bottoni is not None, "con un indirizzo valido il bottone deve esserci")
+    if bottoni is not None:
+        primo = bottoni.inline_keyboard[0][0]
+        check(primo.url == "https://ko-fi.com/esempio", "il bottone punta altrove")
+        check(primo.callback_data is None, "il bottone deve aprire un link, non un callback")
+
+    FintoSettings.supporto_url = ""
+    check(tastiera(FintoSettings()) is None,
+          "senza indirizzo non deve comparire nessun bottone")
+
+    # Un indirizzo non https non deve arrivare fino al bottone
+    os.environ["SUPPORTO_URL"] = "http://esempio.invalido/paga"
+    check(load_settings().supporto_url == "", "un indirizzo non https va scartato")
+    os.environ["SUPPORTO_URL"] = "javascript:alert(1)"
+    check(load_settings().supporto_url == "", "uno schema strano va scartato")
+    os.environ.pop("SUPPORTO_URL")
 
 
 def messaggi_checks() -> None:
@@ -102,6 +129,21 @@ def messaggi_checks() -> None:
     check("🟢" in formatta_scheda(libero), "con 3 posti serve il pallino verde")
     check("\n\n\n" not in formatta_scheda(libero), "righe vuote doppie con dati mancanti")
 
+    # Col posto già libero non c'è niente da aspettare: si dice di andare.
+    check("domanda di cambio medico adesso" in formatta_scheda(libero),
+          "con i posti liberi manca l'invito a fare domanda")
+    check("adesso" not in formatta_scheda(pieno),
+          "col medico pieno non si deve dire di fare domanda")
+
+    from dottping.medici.handlers import _scheda_e_bottoni
+    _, tastiera_pieno = _scheda_e_bottoni(pieno, [], "gironda", "illimitati")
+    check(tastiera_pieno is not None
+          and "Avvisami" in tastiera_pieno.inline_keyboard[0][0].text,
+          "col medico pieno serve la campanella")
+    _, tastiera_libero = _scheda_e_bottoni(libero, [], "gironda", "illimitati")
+    check(tastiera_libero is None,
+          "col posto già libero la campanella non deve comparire")
+
     apertura = formatta_notifica(libero, "illimitati", 0, 3)
     check("POSTI DISPONIBILI" in apertura, "notifica di apertura sbagliata")
     check("domanda di cambio" in apertura, "manca l'indicazione sul da farsi")
@@ -123,11 +165,12 @@ def messaggi_checks() -> None:
 def main() -> int:
     asyncio.run(storage_checks())
     app_checks()
+    supporto_checks()
     messaggi_checks()
     for e in errors:
         print(f"FAIL: {e}")
     if not errors:
-        print("OK: smoke test - storage, comandi, job, bottoni, messaggi, legenda, escaping")
+        print("OK: smoke test - storage, comandi, job, bottoni, supporto, messaggi, legenda, escaping")
     return 1 if errors else 0
 
 

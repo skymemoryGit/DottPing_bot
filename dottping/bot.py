@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 MODULES: Sequence[str] = (
     "dottping.core",
     "dottping.medici.handlers",
+    "dottping.supporto",
 )
 
 COMMANDS = [
@@ -32,9 +33,11 @@ COMMANDS = [
     BotCommand("medico_off", "Togli un medico dalla sorveglianza"),
     BotCommand("medico_check", "Controlla adesso"),
     BotCommand("status", "Stato del bot"),
-    BotCommand("id", "Mostra il tuo id Telegram"),
     BotCommand("help", "Lista comandi"),
+    BotCommand("supporta", "Offri un caffè a DottPing"),
 ]
+# /id resta funzionante ma fuori dal menu: serve a chi configura il bot
+# (ALLOWED_USER_IDS), non a chi cerca un medico.
 
 
 @dataclass
@@ -51,6 +54,16 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _post_init(app: Application) -> None:
     ctx: BotContext = app.bot_data["ctx"]
     await ctx.storage.init()
+
+    # Le pause anti-abuso vivono in memoria, ma vengono salvate: senza questo
+    # ripristino basterebbe aspettare un riavvio per cancellare una pausa da
+    # ventiquattr'ore.
+    try:
+        attive = freni.freni().sanzioni.ripristina(await ctx.storage.kv_prefix("ban:", limit=500))
+        if attive:
+            log.info("Ripristinate %d pause anti-abuso ancora in corso.", attive)
+    except Exception as exc:  # noqa: BLE001 - il bot parte lo stesso
+        log.warning("Pause anti-abuso non ripristinate: %s", exc)
     try:
         await app.bot.set_my_commands(COMMANDS)
     except Exception as exc:  # noqa: BLE001 - il menu è cosmetico

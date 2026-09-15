@@ -107,12 +107,107 @@ class CacheBreve:
         self._voci.clear()
 
 
+# Quanto dura la pausa, alla prima infrazione e a quelle dopo: un minuto,
+# cinque, un quarto d'ora, un'ora, sei ore, un giorno. Chi sbaglia una volta
+# quasi non se ne accorge; chi insiste smette di trovarlo comodo.
+SCALA_PAUSE = (60, 300, 900, 3600, 6 * 3600, 24 * 3600)
+
+# Dopo sei ore senza infrazioni si riparte da capo: una persona che un giorno
+# ha cliccato troppo in fretta non deve pagarla per sempre.
+DECADENZA_S = 6 * 3600
+
+
+class Sanzioni:
+    """Pause progressive per chi continua a sbattere contro i limiti.
+
+    Una finestra scorrevole da sola non basta: superi il limite, aspetti un
+    minuto, ricominci — per sempre. Uno script ci convive benissimo. Qui ogni
+    infrazione *nuova* (fatta a pausa finita, non durante) fa salire di un
+    gradino la volta successiva.
+
+    Il tempo è quello dell'orologio, non `monotonic`: le pause vengono salvate
+    su disco e devono sopravvivere a un riavvio del bot.
+    """
+
+    def __init__(self, scala: tuple[int, ...] = SCALA_PAUSE,
+                 decadenza_s: float = DECADENZA_S) -> None:
+        self.scala = scala
+        self.decadenza_s = decadenza_s
+        self._stato: dict[int, dict] = {}
+
+    def residuo(self, utente: int) -> float:
+        """Secondi che mancano alla fine della pausa. 0 = può parlare."""
+        voce = self._stato.get(utente)
+        if not voce:
+            return 0.0
+        return max(0.0, float(voce.get("fino_a", 0)) - time.time())
+
+    def infrazione(self, utente: int) -> float:
+        """Registra una violazione e restituisce la durata della pausa.
+
+        Se la pausa è già in corso non conta come infrazione nuova: chi è
+        fermo continua a bussare, non sta peggiorando la situazione.
+        """
+        adesso = time.time()
+        residuo = self.residuo(utente)
+        if residuo > 0:
+            return residuo
+
+        voce = self._stato.get(utente) or {}
+        ultima = float(voce.get("ultima", 0))
+        gradini = int(voce.get("gradini", 0))
+        if ultima and adesso - ultima > self.decadenza_s:
+            gradini = 0          # è passato un bel po': fiducia ripristinata
+
+        durata = self.scala[min(gradini, len(self.scala) - 1)]
+        self._stato[utente] = {
+            "utente": utente,
+            "gradini": gradini + 1,
+            "fino_a": adesso + durata,
+            "ultima": adesso,
+        }
+        self._sfoltisci()
+        return float(durata)
+
+    def stato(self, utente: int) -> dict:
+        return dict(self._stato.get(utente) or {})
+
+    def perdona(self, utente: int) -> None:
+        self._stato.pop(utente, None)
+
+    def ripristina(self, voci) -> int:
+        """Ricarica le pause salvate (all'avvio), scartando quelle scadute."""
+        adesso = time.time()
+        quante = 0
+        for voce in voci or ():
+            try:
+                utente = int(voce["utente"])
+            except (TypeError, KeyError, ValueError):
+                continue
+            if float(voce.get("fino_a", 0)) <= adesso and \
+                    adesso - float(voce.get("ultima", 0)) > self.decadenza_s:
+                continue            # scaduta e pure decaduta: si dimentica
+            self._stato[utente] = dict(voce)
+            if float(voce.get("fino_a", 0)) > adesso:
+                quante += 1
+        return quante
+
+    def _sfoltisci(self) -> None:
+        if len(self._stato) <= MAX_CHIAVI:
+            return
+        adesso = time.time()
+        for utente, voce in list(self._stato.items()):
+            if adesso - float(voce.get("ultima", 0)) > self.decadenza_s:
+                del self._stato[utente]
+
+
 class Freni:
     """Tutti i limiti insieme, così chi li usa non deve conoscerne i dettagli."""
 
     def __init__(self, *, comandi_min: int = 20, ricerche_min: int = 5,
                  ricerche_ora: int = 40, portale_min: int = 20,
                  cache_s: float = 120.0, paralleli: int = 2) -> None:
+        self.sanzioni = Sanzioni()
         self.comandi = Finestra(comandi_min, 60)
         self.ricerche_breve = Finestra(ricerche_min, 60)
         self.ricerche_lunga = Finestra(ricerche_ora, 3600)
@@ -134,6 +229,15 @@ class Freni:
             return False
         self._avvisi.segna(utente)
         return True
+
+    # ---------------------------------------------------------- pause
+    def residuo(self, utente: int) -> float:
+        """Secondi di pausa che restano a questo utente (0 = può parlare)."""
+        return self.sanzioni.residuo(utente)
+
+    def infrazione(self, utente: int) -> float:
+        """Un limite è stato superato: fa scattare (o allungare) la pausa."""
+        return self.sanzioni.infrazione(utente)
 
     # ---------------------------------------------------------- ricerche
     def attesa_ricerca(self, utente: int) -> float:
